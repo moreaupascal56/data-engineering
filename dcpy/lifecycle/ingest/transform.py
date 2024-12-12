@@ -18,9 +18,10 @@ OUTPUT_GEOM_COLUMN = "geom"
 class ProcessingSummary(SortedSerializedBase):
     """Summary of the changes from a data processing function."""
 
-    description: str | None = None
-    row_modifications: dict
-    column_modifications: dict
+    description: str
+    row_modifications: dict = {}
+    column_modifications: dict = {}
+    custom: dict = {}
 
 
 class ProcessingResult(SortedSerializedBase, arbitrary_types_allowed=True):
@@ -29,7 +30,7 @@ class ProcessingResult(SortedSerializedBase, arbitrary_types_allowed=True):
 
 
 def make_generic_change_stats(
-    before: pd.DataFrame, after: pd.DataFrame, *, description: str | None
+    before: pd.DataFrame, after: pd.DataFrame, *, description: str
 ) -> ProcessingSummary:
     """Generate a ProcessingSummary by comparing two dataframes before and after processing."""
     initial_columns = set(before.columns)
@@ -99,19 +100,38 @@ class ProcessingFunctions:
 
     def __init__(self, dataset_id: str):
         self.dataset_id = dataset_id
+        self._REPROJECTION_DESCRIPTION_PREFIX = "Reprojected geometries"
+        self._REPROJECTION_NOT_REQUIRED_DESCRIPTION = (
+            "No reprojection required, as source and target crs are the same."
+        )
+        self._SORTED_BY_COLUMNS_DESCRIPTION_PREFIX = "Sorted by columns"
 
     def reproject(self, df: gpd.GeoDataFrame, target_crs: str) -> ProcessingResult:
-        result = transform.reproject_gdf(df, target_crs=target_crs)
-        summary = make_generic_change_stats(
-            df, result, description=f"Reprojected geometries to {target_crs}"
+        starting_crs = df.crs.to_string()
+        needs_reproject = starting_crs != target_crs
+        result = (
+            transform.reproject_gdf(df, target_crs=target_crs)
+            if needs_reproject
+            else df
         )
-        return ProcessingResult(df=result, summary=summary)
+        return ProcessingResult(
+            df=result,
+            summary=ProcessingSummary(
+                row_modifications={"modified": len(df)} if needs_reproject else {},
+                description=f"{self._REPROJECTION_DESCRIPTION_PREFIX} from {starting_crs} to {target_crs}"
+                if needs_reproject
+                else self._REPROJECTION_NOT_REQUIRED_DESCRIPTION,
+            ),
+        )
 
     def sort(self, df: pd.DataFrame, by: list[str], ascending=True) -> ProcessingResult:
         sorted = df.sort_values(by=by, ascending=ascending).reset_index(drop=True)
         summary = make_generic_change_stats(
-            df, sorted, description=f"Sorted by columns: {', '.join(by)}"
+            df,
+            sorted,
+            description=f"{self._SORTED_BY_COLUMNS_DESCRIPTION_PREFIX}: {', '.join(by)}",
         )
+        summary.row_modifications["modified"] = len(df) if not sorted.equals(df) else 0
         return ProcessingResult(df=sorted, summary=summary)
 
     def filter_rows(
@@ -126,35 +146,57 @@ class ProcessingFunctions:
         else:
             filter = df[column_name] == val
         filtered = df[filter].reset_index(drop=True)
-        summary = make_generic_change_stats(df, filtered, description="Filtered rows")
-        return ProcessingResult(df=filtered, summary=summary)
+        return ProcessingResult(
+            df=filtered,
+            summary=ProcessingSummary(
+                description="Filtered Rows",
+                row_modifications={"removed": len(df) - len(filtered)},
+            ),
+        )
 
     def filter_columns(
         self,
         df: pd.DataFrame,
         columns: list[str],
         mode: Literal["keep", "drop"] = "keep",
-    ) -> pd.DataFrame:
-        if mode == "keep":
-            return df[columns]
-        else:
-            return df.drop(columns, axis=1)
+    ) -> ProcessingResult:
+        filtered = df[columns] if mode == "keep" else df.drop(columns, axis=1)
+        return ProcessingResult(
+            df=filtered,
+            summary=ProcessingSummary(
+                description="filtered columns",
+                column_modifications={
+                    "dropped": set(df.columns) - set(filtered.columns)
+                },
+            ),
+        )
 
     def rename_columns(
-        self, df: pd.DataFrame, map: dict[str, str], drop_others=False
+        self, df: pd.DataFrame, drop_others=False, **kwargs
     ) -> ProcessingResult:
+        assert "map" in kwargs, "map must be supplied to rename_columns"
+        col_map: dict[str, str] = kwargs[
+            "map"
+        ]  # doing this to avoid shadowing the builtin `map` fn
         renamed = df.copy()
-        if isinstance(renamed, gpd.GeoDataFrame) and renamed.geometry.name in map:
-            renamed.rename_geometry(map.pop(renamed.geometry.name), inplace=True)
-        renamed = renamed.rename(columns=map, errors="raise")
+        if isinstance(renamed, gpd.GeoDataFrame) and renamed.geometry.name in col_map:
+            renamed.rename_geometry(col_map.pop(renamed.geometry.name), inplace=True)
+        renamed = renamed.rename(columns=col_map, errors="raise")
+        removed_cols = []
         if drop_others:
-            renamed = renamed[list(map.values())]
-        summary = make_generic_change_stats(
-            df,
-            renamed,
-            description=("Renamed columns"),
+            renamed = renamed[list(col_map.values())]
+            removed_cols = [
+                col
+                for col in (set(df.columns) - set(renamed.columns))
+                if col not in col_map
+            ]
+        return ProcessingResult(
+            df=renamed,
+            summary=ProcessingSummary(
+                description="Renamed columns",
+                column_modifications={"renamed": col_map, "removed": removed_cols},
+            ),
         )
-        return ProcessingResult(df=renamed, summary=summary)
 
     def clean_column_names(
         self,
@@ -174,10 +216,14 @@ class ProcessingFunctions:
         if lower:
             columns = [c.lower() for c in columns]
         cleaned.columns = pd.Index(columns)
-        summary = make_generic_change_stats(
-            df, cleaned, description="Cleaned column names"
+        renamed_cols = {old: new for old, new in zip(df.columns, columns) if old != new}
+        return ProcessingResult(
+            df=cleaned,
+            summary=ProcessingSummary(
+                description="Cleaned column names",
+                column_modifications={"renamed": renamed_cols},
+            ),
         )
-        return ProcessingResult(df=cleaned, summary=summary)
 
     def update_column(
         self,
@@ -187,8 +233,13 @@ class ProcessingFunctions:
     ) -> ProcessingResult:
         updated = df.copy()
         updated[column_name] = val
-        summary = make_generic_change_stats(df, updated, description="Updated columns")
-        return ProcessingResult(df=updated, summary=summary)
+        return ProcessingResult(
+            df=updated,
+            summary=ProcessingSummary(
+                description=f"Updated column '{column_name}' with value '{val}'",
+                row_modifications={"updated": len(df)},  # assume we modified all rows
+            ),
+        )
 
     def append_prev(
         self, df: pd.DataFrame, version: str = "latest"
@@ -196,8 +247,10 @@ class ProcessingFunctions:
         prev_df = recipes.read_df(recipes.Dataset(id=self.dataset_id, version=version))
         appended = pd.concat((prev_df, df))
         appended = appended.reset_index(drop=True)
-        summary = make_generic_change_stats(
-            prev_df, appended, description="Appended rows"
+        summary = ProcessingSummary(
+            description=f"Appended rows from previous version: {version}",
+            custom={"previous_version": version},
+            row_modifications={"added": len(prev_df)},
         )
         return ProcessingResult(df=appended, summary=summary)
 
@@ -211,6 +264,7 @@ class ProcessingFunctions:
     ) -> ProcessingResult:
         assert key, "Must provide non-empty list of columns to be used as keys"
         prev_df = recipes.read_df(recipes.Dataset(id=self.dataset_id, version=version))
+        df_initial_cols = set(df.columns)
         df = data.upsert_df_columns(
             prev_df,
             df,
@@ -219,6 +273,17 @@ class ProcessingFunctions:
             missing_key_behavior=missing_key_behavior,
         )
         summary = make_generic_change_stats(prev_df, df, description="Upserted columns")
+        # print(set(prev_df.columns))
+        # print(set(df.columns))
+        summary = ProcessingSummary(
+            description="Appended rows",
+            custom={
+                "previous_version": version,
+            },
+            column_modifications={
+                "added": sorted(list(set(prev_df.columns) - df_initial_cols))
+            },
+        )
         return ProcessingResult(df=df, summary=summary)
 
     def deduplicate(
@@ -232,8 +297,9 @@ class ProcessingFunctions:
         if sort_columns:
             deduped = deduped.sort_values(by=sort_columns, ascending=sort_ascending)
         deduped = deduped.drop_duplicates(by).reset_index(drop=True)
-        summary = make_generic_change_stats(
-            df, deduped, description="Removed duplicates"
+        summary = ProcessingSummary(
+            description="Removed duplicates",
+            row_modifications={"dropped": len(df) - len(deduped)},
         )
         return ProcessingResult(df=deduped, summary=summary)
 
@@ -242,24 +308,28 @@ class ProcessingFunctions:
     ) -> ProcessingResult:
         columns = [df.columns[i] if isinstance(i, int) else i for i in columns]
         result = df.drop(columns, axis=1)
-        summary = make_generic_change_stats(df, result, description="Dropped columns")
+        summary = ProcessingSummary(
+            description="Dropped columns", column_modifications={"dropped": columns}
+        )
         return ProcessingResult(df=result, summary=summary)
 
     def strip_columns(
         self, df: pd.DataFrame, cols: list[str] | None = None
     ) -> ProcessingResult:
         stripped = df.copy()
-        if cols:
-            for col in cols:
-                stripped[col] = stripped[col].str.strip()
-        else:
-            stripped = stripped.apply(
-                lambda x: x.str.strip() if x.dtype == "object" else x
-            )
-        summary = make_generic_change_stats(
-            df, stripped, description="Stripped whitespace"
+        modifications = {}
+        for col in cols or [c for c in df.columns if df[c].dtype == "object"]:
+            stripped[col] = stripped[col].str.strip()
+            modifications[col] = len(stripped[col].compare(df[col]))
+        return ProcessingResult(
+            df=stripped,
+            summary=ProcessingSummary(
+                description="Stripped Whitespace",
+                row_modifications={
+                    "modified": modifications
+                },  # TODO: evaluate if this is performant
+            ),
         )
-        return ProcessingResult(df=stripped, summary=summary)
 
     def coerce_column_types(
         self,
@@ -286,22 +356,32 @@ class ProcessingFunctions:
                     result[column] = pd.to_numeric(result[column], errors=errors)
                 case "integer" | "bigint" as t:
                     mapping = {"integer": "Int32", "bigint": "Int64"}
-                    result[column] = pd.array(result[column], dtype=mapping[t]) # type: ignore
+                    result[column] = pd.array(result[column], dtype=mapping[t])  # type: ignore
                 case "string":
                     result[column] = result[column].apply(to_str)
                 case "date":
                     result[column] = pd.to_datetime(
                         result[column], errors=errors
                     ).dt.date
-                    result[column] = result[column].replace(pd.NaT, None) # type: ignore
+                    result[column] = result[column].replace(pd.NaT, None)  # type: ignore
                 case "datetime":
                     result[column] = pd.to_datetime(result[column], errors=errors)
-                    result[column] = result[column].replace(pd.NaT, None) # type: ignore
-        summary = make_generic_change_stats(
-            df, result, description="Coerced column types"
-        )
-        return ProcessingResult(df=result, summary=summary)
+                    result[column] = result[column].replace(pd.NaT, None)  # type: ignore
 
+        modified_cols = df.dtypes.sort_index() == result.dtypes.sort_index()
+        modified = modified_cols.loc[modified_cols == False].keys()
+
+        return ProcessingResult(
+            df=result,
+            summary=ProcessingSummary(
+                description="Coerced Column Types",
+                column_modifications={
+                    "modified": {c: str(result[c].dtype) for c in modified}
+                },  # TODO: evaluate if this is performant
+            ),
+        )
+
+    # TODO
     def multi(self, df: gpd.GeoDataFrame) -> ProcessingResult:
         multi_gdf = df.copy()
         multi_gdf.set_geometry(
